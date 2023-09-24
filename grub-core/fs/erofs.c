@@ -28,14 +28,24 @@
 #include <grub/safemath.h>
 #include <grub/types.h>
 
+#include <lz4_decompress.h>
+
 GRUB_MOD_LICENSE ("GPLv3+");
 
 #define EROFS_SUPER_OFFSET (1024)
 #define EROFS_MAGIC 0xE0F5E1E2
 #define EROFS_ISLOTBITS (5)
+#define EROFS_MAX_BLOCK_SIZE (4096)
 
+#define EROFS_FEATURE_INCOMPAT_ZERO_PADDING 0x00000001
+#define EROFS_FEATURE_INCOMPAT_BIG_PCLUSTER 0x00000002
 #define EROFS_FEATURE_INCOMPAT_CHUNKED_FILE 0x00000004
-#define EROFS_ALL_FEATURE_INCOMPAT (EROFS_FEATURE_INCOMPAT_CHUNKED_FILE)
+#define EROFS_FEATURE_INCOMPAT_ZTAILPACKING 0x00000010
+#define EROFS_FEATURE_INCOMPAT_FRAGMENTS 0x00000020
+#define EROFS_ALL_FEATURE_INCOMPAT                                             \
+  (EROFS_FEATURE_INCOMPAT_ZERO_PADDING | EROFS_FEATURE_INCOMPAT_BIG_PCLUSTER | \
+   EROFS_FEATURE_INCOMPAT_CHUNKED_FILE | EROFS_FEATURE_INCOMPAT_ZTAILPACKING | \
+   EROFS_FEATURE_INCOMPAT_FRAGMENTS)
 
 struct grub_erofs_super
 {
@@ -183,13 +193,141 @@ struct grub_erofs_dirent
   grub_uint8_t reserved;
 } GRUB_PACKED;
 
-#define EROFS_MAP_MAPPED 0x02
+#define EROFS_MAP_MAPPED (1 << 1)
+#define EROFS_MAP_FULL_MAPPED (1 << 3)
+#define EROFS_MAP_FRAGMENT (1 << 4)
+#define EROFS_MAP_PARTIAL_REF (1 << 5)
+
+/* Used to map tail extent for tailpacking inline or fragment pcluster */
+#define EROFS_ZIP_GET_BLOCKS_FINDTAIL 0x0008
 
 struct grub_erofs_map_blocks
 {
   grub_off_t m_pa, m_la;
   grub_off_t m_plen, m_llen;
   grub_uint32_t m_flags;
+  grub_uint8_t m_algorithmformat;
+
+  grub_off_t index;
+  char mpage[EROFS_MAX_BLOCK_SIZE];
+};
+
+enum
+{
+  EROFS_COMPRESSION_LZ4,
+  EROFS_COMPRESSION_MAX
+};
+
+enum
+{
+  EROFS_COMPRESSION_SHIFTED = EROFS_COMPRESSION_MAX,
+  EROFS_COMPRESSION_INTERLACED,
+  EROFS_COMPRESSION_RUNTIME_MAX
+};
+
+struct grub_erofs_zip_maprecorder
+{
+  struct grub_fshelp_node *node;
+  struct grub_erofs_map_blocks *map;
+
+  grub_off_t lcn;
+  grub_uint8_t type, headtype;
+  grub_uint16_t clusterofs;
+  grub_uint16_t delta[2];
+  grub_off_t pblk, compressedblks;
+  grub_off_t nextpackoff;
+
+  bool partialref;
+};
+
+#define EROFS_ZIP_ADVISE_COMPACTED_2B 0x0001
+#define EROFS_ZIP_ADVISE_BIG_PCLUSTER_1 0x0002
+#define EROFS_ZIP_ADVISE_INLINE_PCLUSTER 0x0008
+#define EROFS_ZIP_ADVISE_INTERLACED_PCLUSTER 0x0010
+#define EROFS_ZIP_ADVISE_FRAGMENT_PCLUSTER 0x0020
+
+#define EROFS_ZIP_FRAGMENT_INODE_BIT 7
+
+struct grub_erofs_zip_header
+{
+  union
+  {
+    grub_uint32_t h_fragmentoff;
+
+    struct
+    {
+      grub_uint16_t h_reserved1;
+      /* indicate the encoded size of tailpacking data */
+      grub_uint16_t h_idata_size;
+    };
+  };
+
+  grub_uint16_t h_advise;
+  /*
+	 * bit 0-3 : algorithm type of head 1 (logical cluster type 01);
+	 * bit 4-7 : algorithm type of head 2 (logical cluster type 11).
+	 */
+  grub_uint8_t h_algorithmtype;
+  /*
+	 * bit 0-2 : logical cluster bits - 12, e.g. 0 for 4096;
+	 * bit 3-6 : reserved;
+	 * bit 7   : move the whole file into packed inode or not.
+	 */
+  grub_uint8_t h_clusterbits;
+};
+
+enum
+{
+  EROFS_ZIP_LCLUSTER_TYPE_PLAIN = 0,
+  EROFS_ZIP_LCLUSTER_TYPE_HEAD1 = 1,
+  EROFS_ZIP_LCLUSTER_TYPE_NONHEAD = 2,
+  EROFS_ZIP_LCLUSTER_TYPE_HEAD2 = 3,
+  EROFS_ZIP_LCLUSTER_TYPE_MAX
+};
+
+#define EROFS_ZIP_LI_LCLUSTER_TYPE_MASKS 0x03
+#define EROFS_ZIP_LI_LCLUSTER_TYPE_BIT 0
+
+/* (noncompact only, HEAD) This pcluster refers to partial decompressed data */
+#define EROFS_ZIP_LI_PARTIAL_REF (1 << 15)
+
+/*
+ * D0_CBLKCNT will be marked _only_ at the 1st non-head lcluster to store the
+ * compressed block count of a compressed extent (in logical clusters, aka.
+ * block count of a pcluster).
+ */
+#define EROFS_ZIP_LI_D0_CBLKCNT (1 << 11)
+
+struct grub_erofs_zip_lcluster_index
+{
+  grub_uint16_t di_advise;
+  grub_uint16_t di_clusterofs;
+
+  union
+  {
+    /* for the HEAD lclusters */
+    grub_uint32_t blkaddr;
+    /* for the NONHEAD lclusters */
+    grub_uint16_t delta[2];
+  } di_u;
+};
+
+#define EROFS_ZIP_FULL_INDEX_ALIGN(end) \
+  (ALIGN_UP (end, 8) + sizeof (struct grub_erofs_zip_header) + 8)
+
+struct grub_erofs_zip_decompress_req
+{
+  struct grub_erofs_data *data;
+
+  char *in, *out;
+
+  grub_uint32_t decodedskip;
+  grub_uint32_t inputsize, decodedlength;
+
+  grub_uint32_t interlaced_offset;
+
+  grub_uint8_t alg;
+  bool partial_decoding;
 };
 
 struct grub_erofs_xattr_ibody_header
@@ -211,6 +349,19 @@ struct grub_fshelp_node
 
   /* if the inode has been read into memory? */
   bool inode_read;
+
+  grub_uint16_t z_advise;
+  grub_uint8_t z_algorithmtype[2];
+  grub_uint8_t z_log2_lclustersize;
+  grub_uint64_t z_tailextent_headlcn;
+
+  grub_uint32_t z_idataoff;
+  grub_uint16_t z_idatasize;
+
+  grub_uint64_t fragment_off;
+  grub_uint32_t fragment_size;
+
+  bool z_header_read;
 };
 
 struct grub_erofs_data
@@ -308,6 +459,13 @@ erofs_inode_xattr_ibody_size (grub_fshelp_node_t node)
 }
 
 static inline grub_uint64_t
+erofs_inode_nblocks (grub_fshelp_node_t node)
+{
+  return (erofs_inode_file_size (node) + erofs_blocksz (node->data) - 1) >>
+	 node->data->sb.log2_blksz;
+}
+
+static inline grub_uint64_t
 erofs_inode_mtime (grub_fshelp_node_t node)
 {
   return node->inode_type == EROFS_INODE_LAYOUT_COMPACT
@@ -325,7 +483,7 @@ grub_erofs_map_blocks_flatmode (grub_fshelp_node_t node,
   grub_uint32_t blocksz = erofs_blocksz (node->data);
 
   file_size = erofs_inode_file_size (node);
-  nblocks = (file_size + blocksz - 1) >> node->data->sb.log2_blksz;
+  nblocks = erofs_inode_nblocks(node);
   lastblk = nblocks - tailendpacking;
 
   map->m_flags = EROFS_MAP_MAPPED;
@@ -459,18 +617,11 @@ static grub_err_t
 grub_erofs_read_raw_data (grub_fshelp_node_t node, char *buf, grub_off_t size,
 			  grub_off_t offset, grub_off_t *bytes)
 {
-  struct grub_erofs_map_blocks map;
+  struct grub_erofs_map_blocks map = {.index = GRUB_UINT_MAX};
   grub_err_t err;
 
   if (bytes)
     *bytes = 0;
-
-  if (!node->inode_read)
-    {
-      err = grub_erofs_read_inode (node->data, node);
-      if (err)
-	return err;
-    }
 
   grub_memset (&map, 0, sizeof (map));
 
@@ -526,6 +677,826 @@ grub_erofs_read_raw_data (grub_fshelp_node_t node, char *buf, grub_off_t size,
   return GRUB_ERR_NONE;
 }
 
+static grub_err_t
+grub_erofs_zip_do_map_blocks (grub_fshelp_node_t node,
+			      struct grub_erofs_map_blocks *map, int flags);
+
+static grub_err_t
+grub_erofs_zip_read_header (grub_fshelp_node_t node)
+{
+  grub_off_t pos;
+  struct grub_erofs_zip_header h;
+  grub_err_t err = GRUB_ERR_NONE;
+
+  if (node->z_header_read)
+    return 0;
+
+  pos = ALIGN_UP (erofs_iloc (node) + erofs_inode_size (node) +
+		      erofs_inode_xattr_ibody_size (node),
+		  8);
+  err = grub_disk_read (node->data->disk, pos >> GRUB_DISK_SECTOR_BITS,
+			pos & (GRUB_DISK_SECTOR_SIZE - 1),
+			sizeof (struct grub_erofs_zip_header), &h);
+  if (err)
+    return err;
+
+  /* the whole file is stored in the packed inode */
+  if (h.h_clusterbits >> EROFS_ZIP_FRAGMENT_INODE_BIT)
+    {
+      node->z_advise = EROFS_ZIP_ADVISE_FRAGMENT_PCLUSTER;
+      node->fragment_off =
+	  grub_le_to_cpu64 (*((grub_uint64_t *) (void *) &h) ^ (1ULL << 63));
+      node->z_tailextent_headlcn = 0;
+      goto out;
+    }
+
+  node->z_advise = grub_le_to_cpu16 (h.h_advise);
+  node->z_algorithmtype[0] = h.h_algorithmtype & 0xF;
+  node->z_algorithmtype[1] = (h.h_algorithmtype >> 4) & 0xF;
+
+  if (node->z_algorithmtype[0] >= EROFS_COMPRESSION_MAX)
+    return grub_error (GRUB_ERR_BAD_FS, "unsupported compression algorithm %u",
+		       node->z_algorithmtype[0]);
+
+  node->z_log2_lclustersize =
+      node->data->sb.log2_blksz + (h.h_clusterbits & 0x7);
+
+  if (node->z_advise & EROFS_ZIP_ADVISE_INLINE_PCLUSTER)
+    {
+      struct grub_erofs_map_blocks map = {.index = GRUB_UINT_MAX};
+
+      node->z_idatasize = grub_le_to_cpu16 (h.h_idata_size);
+      err = grub_erofs_zip_do_map_blocks (node, &map,
+					  EROFS_ZIP_GET_BLOCKS_FINDTAIL);
+      if (err)
+	return err;
+    }
+
+  if (node->z_advise & EROFS_ZIP_ADVISE_FRAGMENT_PCLUSTER &&
+      !(h.h_clusterbits >> EROFS_ZIP_FRAGMENT_INODE_BIT))
+    {
+      struct grub_erofs_map_blocks map = {.index = GRUB_UINT_MAX};
+
+      node->fragment_off = grub_le_to_cpu32 (h.h_fragmentoff);
+      err = grub_erofs_zip_do_map_blocks (node, &map,
+					  EROFS_ZIP_GET_BLOCKS_FINDTAIL);
+      if (err)
+	return err;
+    }
+
+out:
+  node->z_header_read = true;
+  return err;
+}
+
+static grub_err_t
+grub_erofs_zip_load_cluster_index (struct grub_erofs_zip_maprecorder *m,
+				   grub_off_t blkno)
+{
+  struct grub_erofs_map_blocks *map = m->map;
+  const struct grub_erofs_data *data = m->node->data;
+  grub_off_t addr = blkno << data->sb.log2_blksz;
+  grub_err_t err;
+
+  if (map->index == blkno)
+    return GRUB_ERR_NONE;
+
+  err = grub_disk_read (data->disk, addr >> GRUB_DISK_SECTOR_BITS,
+			addr & (GRUB_DISK_SECTOR_SIZE - 1),
+			erofs_blocksz (data), (void *) map->mpage);
+  if (err)
+    return err;
+
+  map->index = blkno;
+
+  return GRUB_ERR_NONE;
+}
+
+static grub_err_t
+grub_erofs_zip_load_cluster_full (struct grub_erofs_zip_maprecorder *m,
+				  grub_uint64_t lcn)
+{
+  grub_fshelp_node_t node = m->node;
+  grub_off_t pos =
+      EROFS_ZIP_FULL_INDEX_ALIGN (erofs_iloc (node) + erofs_inode_size (node) +
+				  erofs_inode_xattr_ibody_size (node)) +
+      lcn * sizeof (struct grub_erofs_zip_lcluster_index);
+  struct grub_erofs_zip_lcluster_index *di;
+  grub_uint16_t advise, type;
+  grub_err_t err;
+
+  err = grub_erofs_zip_load_cluster_index (m, pos >> node->data->sb.log2_blksz);
+  if (err)
+    return err;
+
+  m->nextpackoff = pos + sizeof (struct grub_erofs_zip_lcluster_index);
+  m->lcn = lcn;
+  di = (void *) (m->map->mpage + (pos & (erofs_blocksz (node->data) - 1)));
+
+  advise = grub_cpu_to_le16 (di->di_advise);
+  type = (advise >> EROFS_ZIP_LI_LCLUSTER_TYPE_BIT) &
+	 EROFS_ZIP_LI_LCLUSTER_TYPE_MASKS;
+  switch (type)
+    {
+    case EROFS_ZIP_LCLUSTER_TYPE_NONHEAD:
+      m->clusterofs = 1 << node->z_log2_lclustersize;
+      m->delta[0] = grub_cpu_to_le16 (di->di_u.delta[0]);
+      if (m->delta[0] & EROFS_ZIP_LI_D0_CBLKCNT)
+	{
+	  if (!(advise & EROFS_ZIP_ADVISE_BIG_PCLUSTER_1))
+	    return grub_error (GRUB_ERR_BAD_FS, "bogus big pcluster");
+	  m->compressedblks = m->delta[0] & ~EROFS_ZIP_LI_D0_CBLKCNT;
+	  m->delta[0] = 1;
+	}
+      m->delta[1] = grub_cpu_to_le16 (di->di_u.delta[1]);
+      break;
+    case EROFS_ZIP_LCLUSTER_TYPE_PLAIN:
+    case EROFS_ZIP_LCLUSTER_TYPE_HEAD1:
+      if (advise & EROFS_ZIP_LI_PARTIAL_REF)
+	m->partialref = true;
+      m->clusterofs = grub_cpu_to_le16 (di->di_clusterofs);
+      m->pblk = grub_cpu_to_le32 (di->di_u.blkaddr);
+      break;
+    default:
+      return grub_error (GRUB_ERR_BAD_FS, "unsupported cluster type %u", type);
+    }
+  m->type = type;
+  return GRUB_ERR_NONE;
+}
+
+static unsigned int
+grub_erofs_zip_decode_compactedbits (unsigned int lobits, unsigned int lomask,
+				     grub_uint8_t *in, unsigned int pos,
+				     grub_uint8_t *type)
+{
+  const unsigned int v =
+      grub_le_to_cpu32 (grub_get_unaligned32 (in + pos / 8)) >> (pos & 7);
+  const unsigned int lo = v & lomask;
+
+  *type = (v >> lobits) & 3;
+  return lo;
+}
+
+static grub_err_t
+grub_erofs_zip_unpack_compacted_index (struct grub_erofs_zip_maprecorder *m,
+				       unsigned int amortizedshift,
+				       grub_off_t pos)
+{
+  grub_fshelp_node_t node = m->node;
+  const unsigned int lclusterbits = node->z_log2_lclustersize;
+  const unsigned int lomask = (1 << lclusterbits) - 1;
+  unsigned int vcnt, base, lo, encodebits, nblk, eofs;
+  int i;
+  grub_uint8_t *in, type;
+  bool big_pcluster;
+
+  if (1 << amortizedshift == 4)
+    vcnt = 2;
+  else if (1 << amortizedshift == 2 && lclusterbits == 12)
+    vcnt = 16;
+  else
+    return GRUB_ERR_BAD_FS;
+
+  m->nextpackoff =
+      ALIGN_DOWN (pos, vcnt << amortizedshift) + (vcnt << amortizedshift);
+  big_pcluster = node->z_advise & EROFS_ZIP_ADVISE_BIG_PCLUSTER_1;
+  encodebits = ((vcnt << amortizedshift) - sizeof (grub_uint32_t)) * 8 / vcnt;
+  eofs = pos & (erofs_blocksz (node->data) - 1);
+  base = ALIGN_DOWN (eofs, vcnt << amortizedshift);
+  in = (void *) (m->map->mpage + base);
+
+  i = (eofs - base) >> amortizedshift;
+
+  lo = grub_erofs_zip_decode_compactedbits (lclusterbits, lomask, in,
+					    encodebits * i, &type);
+  m->type = type;
+  if (type == EROFS_ZIP_LCLUSTER_TYPE_NONHEAD)
+    {
+      m->clusterofs = 1 << lclusterbits;
+
+      if (lo & EROFS_ZIP_LI_D0_CBLKCNT)
+	{
+	  if (!big_pcluster)
+	    return GRUB_ERR_BAD_FS;
+	  m->compressedblks = lo & ~EROFS_ZIP_LI_D0_CBLKCNT;
+	  m->delta[0] = 1;
+	  return GRUB_ERR_NONE;
+	}
+      else if (i + 1 != (int) vcnt)
+	{
+	  m->delta[0] = lo;
+	  return GRUB_ERR_NONE;
+	}
+
+      lo = grub_erofs_zip_decode_compactedbits (lclusterbits, lomask, in,
+						encodebits * (i - 1), &type);
+      if (type != EROFS_ZIP_LCLUSTER_TYPE_NONHEAD)
+	lo = 0;
+      else if (lo & EROFS_ZIP_LI_D0_CBLKCNT)
+	lo = 1;
+      m->delta[0] = lo + 1;
+      return GRUB_ERR_NONE;
+    }
+
+  m->clusterofs = lo;
+  m->delta[0] = 0;
+  if (!big_pcluster)
+    {
+      nblk = 1;
+      while (i > 0)
+	{
+	  --i;
+	  lo = grub_erofs_zip_decode_compactedbits (lclusterbits, lomask, in,
+						    encodebits * i, &type);
+	  if (type == EROFS_ZIP_LCLUSTER_TYPE_NONHEAD)
+	    i -= lo;
+
+	  if (i >= 0)
+	    ++nblk;
+	}
+    }
+  else
+    {
+      nblk = 0;
+      while (i > 0)
+	{
+	  --i;
+	  lo = grub_erofs_zip_decode_compactedbits (lclusterbits, lomask, in,
+						    encodebits * i, &type);
+	  if (type == EROFS_ZIP_LCLUSTER_TYPE_NONHEAD)
+	    {
+	      if (lo & EROFS_ZIP_LI_D0_CBLKCNT)
+		{
+		  --i;
+		  nblk += lo & ~EROFS_ZIP_LI_D0_CBLKCNT;
+		  continue;
+		}
+	      if (lo <= 1)
+		return GRUB_ERR_BAD_FS;
+	      i -= lo - 2;
+	      continue;
+	    }
+	  ++nblk;
+	}
+    }
+  in += (vcnt << amortizedshift) - sizeof (grub_uint32_t);
+  m->pblk = grub_le_to_cpu32 (*(grub_uint32_t *) (void *) in) + nblk;
+  return 0;
+}
+
+static grub_err_t
+grub_erofs_zip_load_cluster_compact (struct grub_erofs_zip_maprecorder *m,
+				     grub_uint64_t lcn)
+{
+  grub_fshelp_node_t node = m->node;
+  const grub_off_t ebase =
+      ALIGN_UP (erofs_iloc (node) + erofs_inode_size (node) +
+		    erofs_inode_xattr_ibody_size (node),
+		8) +
+      sizeof (struct grub_erofs_zip_header);
+  const unsigned int totalidx = erofs_inode_nblocks (node);
+  const unsigned int lclusterbits = node->z_log2_lclustersize;
+  unsigned int compacted_4b_initial, compacted_2b;
+  unsigned int amortizedshift;
+  grub_off_t pos;
+  grub_err_t err;
+
+  if (lclusterbits != 12 || lcn >= totalidx)
+    return GRUB_ERR_BAD_FS;
+
+  m->lcn = lcn;
+
+  compacted_4b_initial = (32 - ebase % 32) / 4;
+  if (compacted_4b_initial == 32 / 4)
+    compacted_4b_initial = 0;
+
+  if ((node->z_advise & EROFS_ZIP_ADVISE_COMPACTED_2B) &&
+      compacted_4b_initial < totalidx)
+    compacted_2b = ALIGN_DOWN (totalidx - compacted_4b_initial, 16);
+  else
+    compacted_2b = 0;
+
+  pos = ebase;
+  if (lcn < compacted_4b_initial)
+    {
+      amortizedshift = 2;
+      goto out;
+    }
+  pos += compacted_4b_initial * 4;
+  lcn -= compacted_4b_initial;
+
+  if (lcn < compacted_2b)
+    {
+      amortizedshift = 1;
+      goto out;
+    }
+  pos += compacted_2b * 2;
+  lcn -= compacted_2b;
+  amortizedshift = 2;
+
+out:
+  pos += lcn * (1 << amortizedshift);
+  err = grub_erofs_zip_load_cluster_index (m, pos >> node->data->sb.log2_blksz);
+  if (err)
+    return err;
+  return grub_erofs_zip_unpack_compacted_index (m, amortizedshift, pos);
+}
+
+static grub_err_t
+grub_erofs_zip_load_cluster (struct grub_erofs_zip_maprecorder *m,
+			     grub_uint64_t lcn)
+{
+  grub_uint8_t datalayout = m->node->inode_datalayout;
+
+  if (datalayout == EROFS_INODE_COMPRESSED_FULL)
+    return grub_erofs_zip_load_cluster_full (m, lcn);
+
+  if (datalayout == EROFS_INODE_COMPRESSED_COMPACT)
+    return grub_erofs_zip_load_cluster_compact (m, lcn);
+
+  return GRUB_ERR_BAD_FS;
+}
+
+static grub_err_t
+grub_erofs_zip_extent_lookback (struct grub_erofs_zip_maprecorder *m,
+				grub_uint64_t lookback_distance)
+{
+  grub_uint64_t lcn = m->lcn;
+  grub_err_t err;
+
+  if (lcn < lookback_distance)
+    return grub_error (GRUB_ERR_BAD_FS,
+		       "bogus lookback distance @ inode %" PRIuGRUB_UINT64_T,
+		       m->node->ino);
+
+  lcn -= lookback_distance;
+  err = grub_erofs_zip_load_cluster (m, lcn);
+  if (err)
+    return err;
+
+  switch (m->type)
+    {
+    case EROFS_ZIP_LCLUSTER_TYPE_NONHEAD:
+      if (!m->delta[0])
+	return grub_error (
+	    GRUB_ERR_BAD_FS,
+	    "invalid lookback distance 0 @ inode %" PRIuGRUB_UINT64_T,
+	    m->node->ino);
+      return grub_erofs_zip_extent_lookback (m, m->delta[0]);
+    case EROFS_ZIP_LCLUSTER_TYPE_PLAIN:
+    case EROFS_ZIP_LCLUSTER_TYPE_HEAD1:
+      m->headtype = m->type;
+      m->map->m_la = (lcn << m->node->z_log2_lclustersize) | m->clusterofs;
+      break;
+    default:
+      return grub_error (GRUB_ERR_BAD_FS,
+			 "unknown lcluster type %u @ inode %" PRIuGRUB_UINT64_T,
+			 m->type, m->node->ino);
+    }
+  return GRUB_ERR_NONE;
+}
+
+static grub_err_t
+grub_erofs_zip_get_extent_compressedlen (struct grub_erofs_zip_maprecorder *m)
+{
+  struct grub_fshelp_node *node = m->node;
+  struct grub_erofs_map_blocks *map = m->map;
+  grub_uint8_t lclusterbits = node->z_log2_lclustersize;
+  grub_uint64_t lcn;
+  grub_err_t err;
+
+  if (m->headtype == EROFS_ZIP_LCLUSTER_TYPE_PLAIN ||
+      !(node->z_advise & EROFS_ZIP_ADVISE_BIG_PCLUSTER_1))
+    {
+      map->m_plen = 1 << lclusterbits;
+      return GRUB_ERR_NONE;
+    }
+
+  lcn = m->lcn + 1;
+  if (m->compressedblks)
+    goto out;
+
+  err = grub_erofs_zip_load_cluster (m, lcn);
+  if (err)
+    return err;
+
+  switch (m->type)
+    {
+    case EROFS_ZIP_LCLUSTER_TYPE_PLAIN:
+    case EROFS_ZIP_LCLUSTER_TYPE_HEAD1:
+      m->compressedblks = 1 << (lclusterbits - node->data->sb.log2_blksz);
+      break;
+    case EROFS_ZIP_LCLUSTER_TYPE_NONHEAD:
+      if (m->delta[0] != 1)
+	return grub_error (GRUB_ERR_BAD_FS,
+			   "bogus CBLKCNT of lcn %" PRIuGRUB_UINT64_T
+			   " @ inode %" PRIuGRUB_UINT64_T,
+			   lcn, node->ino);
+      if (m->compressedblks)
+	break;
+      /* fallthrough */
+    default:
+      return grub_error (GRUB_ERR_BAD_FS,
+			 "cannot found CBLKCNT of lcn %" PRIuGRUB_UINT64_T
+			 " @ inode %" PRIuGRUB_UINT64_T,
+			 lcn, node->ino);
+    }
+
+out:
+  map->m_plen = m->compressedblks << lclusterbits;
+  return GRUB_ERR_NONE;
+}
+
+static grub_err_t
+grub_erofs_zip_do_map_blocks (grub_fshelp_node_t node,
+			      struct grub_erofs_map_blocks *map, int flags)
+{
+  struct grub_erofs_zip_maprecorder m = {
+      .node = node,
+      .map = map,
+  };
+  bool ztailpacking = node->z_advise & EROFS_ZIP_ADVISE_INLINE_PCLUSTER;
+  bool fragment = node->z_advise & EROFS_ZIP_ADVISE_FRAGMENT_PCLUSTER;
+  grub_uint64_t file_size = erofs_inode_file_size (node);
+  grub_uint8_t lclusterbits;
+  grub_uint64_t initial_lcn, ofs, end, endoff;
+  grub_err_t err;
+
+  lclusterbits = node->z_log2_lclustersize;
+  ofs = flags & EROFS_ZIP_GET_BLOCKS_FINDTAIL ? file_size - 1 : map->m_la;
+  initial_lcn = ofs >> lclusterbits;
+  endoff = ofs & ((1 << lclusterbits) - 1);
+
+  err = grub_erofs_zip_load_cluster (&m, initial_lcn);
+  if (err)
+    return err;
+
+  if (ztailpacking && (flags & EROFS_ZIP_GET_BLOCKS_FINDTAIL))
+    node->z_idataoff = m.nextpackoff;
+
+  map->m_flags = EROFS_MAP_MAPPED;
+  end = (m.lcn + 1ULL) << lclusterbits;
+  switch (m.type)
+    {
+    case EROFS_ZIP_LCLUSTER_TYPE_PLAIN:
+    case EROFS_ZIP_LCLUSTER_TYPE_HEAD1:
+      if (endoff >= m.clusterofs)
+	{
+	  m.headtype = m.type;
+	  map->m_la = (m.lcn << lclusterbits) | m.clusterofs;
+
+	  if (ztailpacking && end > file_size)
+	    end = file_size;
+	  break;
+	}
+      if (!m.lcn)
+	return grub_error (
+	    GRUB_ERR_BAD_FS,
+	    "invalid logical cluster 0 @ inode %" PRIuGRUB_UINT64_T, node->ino);
+      end = (m.lcn << lclusterbits) | m.clusterofs;
+      map->m_flags |= EROFS_MAP_FULL_MAPPED;
+      m.delta[0] = 1;
+      /* fallthrough */
+    case EROFS_ZIP_LCLUSTER_TYPE_NONHEAD:
+      err = grub_erofs_zip_extent_lookback (&m, m.delta[0]);
+      if (err)
+	return err;
+      break;
+    default:
+      return grub_error (GRUB_ERR_BAD_FS,
+			 "unknown lcluster type %u @ inode %" PRIuGRUB_UINT64_T,
+			 m.type, node->ino);
+    }
+
+  if (m.partialref)
+    map->m_flags |= EROFS_MAP_PARTIAL_REF;
+  map->m_llen = end - map->m_la;
+
+  if (flags & EROFS_ZIP_GET_BLOCKS_FINDTAIL)
+    {
+      node->z_tailextent_headlcn = m.lcn;
+      if (fragment && node->inode_datalayout == EROFS_INODE_COMPRESSED_FULL)
+	node->fragment_off |= m.pblk << 32;
+    }
+
+  if (ztailpacking && m.lcn == node->z_tailextent_headlcn)
+    {
+      map->m_pa = node->z_idataoff;
+      map->m_plen = node->z_idatasize;
+    }
+  else if (fragment && m.lcn == node->z_tailextent_headlcn)
+    map->m_flags |= EROFS_MAP_FRAGMENT;
+  else
+    {
+      map->m_pa = m.pblk << node->data->sb.log2_blksz;
+      err = grub_erofs_zip_get_extent_compressedlen (&m);
+      if (err)
+	return err;
+    }
+
+  if (m.headtype == EROFS_ZIP_LCLUSTER_TYPE_PLAIN)
+    {
+      if (map->m_llen > map->m_plen)
+	return grub_error (GRUB_ERR_BAD_FS,
+			   "invalid extent length @ inode %" PRIuGRUB_UINT64_T,
+			   node->ino);
+
+      map->m_algorithmformat =
+	  (node->z_advise & EROFS_ZIP_ADVISE_INTERLACED_PCLUSTER)
+	      ? EROFS_COMPRESSION_INTERLACED
+	      : EROFS_COMPRESSION_SHIFTED;
+    }
+  else
+    map->m_algorithmformat = node->z_algorithmtype[0];
+
+  return err;
+}
+
+static grub_err_t
+grub_erofs_zip_map_blocks_iter (grub_fshelp_node_t node,
+				struct grub_erofs_map_blocks *map)
+{
+  grub_uint64_t file_size = erofs_inode_file_size (node);
+  grub_err_t err = GRUB_ERR_NONE;
+
+  if (map->m_la >= file_size)
+    {
+      map->m_llen = map->m_la + 1 - file_size;
+      map->m_la = file_size;
+      map->m_flags = 0;
+      return GRUB_ERR_NONE;
+    }
+
+  err = grub_erofs_zip_read_header (node);
+  if (err)
+    return err;
+
+  if ((node->z_advise & EROFS_ZIP_ADVISE_FRAGMENT_PCLUSTER) &&
+      !node->z_tailextent_headlcn)
+    {
+      map->m_la = 0;
+      map->m_llen = file_size;
+      map->m_flags =
+	  EROFS_MAP_MAPPED | EROFS_MAP_FULL_MAPPED | EROFS_MAP_FRAGMENT;
+      return GRUB_ERR_NONE;
+    }
+
+  err = grub_erofs_zip_do_map_blocks (node, map, 0);
+
+  return err;
+}
+
+static grub_err_t
+grub_erofs_zip_decompress_lz4 (struct grub_erofs_zip_decompress_req *rq)
+{
+  int ret = 0;
+  char *dest = rq->out, *src = rq->in;
+  char *buff = NULL;
+  bool support_0padding = false;
+  grub_uint32_t inputmargin = 0;
+  grub_err_t err = GRUB_ERR_NONE;
+
+  if (grub_le_to_cpu32 (rq->data->sb.feature_incompat) &
+      EROFS_FEATURE_INCOMPAT_ZERO_PADDING)
+    {
+      support_0padding = true;
+
+      while (!src[inputmargin & (erofs_blocksz (rq->data) - 1)])
+	if (!(++inputmargin & (erofs_blocksz (rq->data) - 1)))
+	  break;
+
+      if (inputmargin >= rq->inputsize)
+	return grub_error (GRUB_ERR_BAD_FS, "invalid lz4 inputmargin %u",
+			   inputmargin);
+    }
+
+  if (rq->decodedskip)
+    {
+      buff = grub_malloc (rq->decodedlength);
+      if (!buff)
+	return grub_error (GRUB_ERR_OUT_OF_MEMORY, "out of memory");
+      dest = buff;
+    }
+
+  if (rq->partial_decoding || !support_0padding)
+    ret = LZ4_decompress_safe_partial (src + inputmargin, dest,
+				       rq->inputsize - inputmargin,
+				       rq->decodedlength, rq->decodedlength);
+  else
+    ret = LZ4_decompress_safe (src + inputmargin, dest,
+			       rq->inputsize - inputmargin, rq->decodedlength);
+
+  if (ret != (int) rq->decodedlength)
+    {
+      err = grub_error (GRUB_ERR_BAD_FS,
+			"lz4 decompress failed: ret=%d, expect=%d", ret,
+			(int) rq->decodedlength);
+      goto out;
+    }
+
+  if (rq->decodedskip)
+    grub_memcpy (rq->out, dest + rq->decodedskip,
+		 rq->decodedlength - rq->decodedskip);
+
+out:
+  if (buff)
+    grub_free (buff);
+
+  return err;
+}
+
+static grub_err_t
+grub_erofs_zip_decompress (struct grub_erofs_zip_decompress_req *rq)
+{
+  if (rq->alg == EROFS_COMPRESSION_SHIFTED)
+    {
+      if (rq->decodedlength > rq->inputsize)
+	return grub_error (GRUB_ERR_BAD_FS, "invalid decompress request");
+
+      grub_memcpy (rq->out, rq->in + rq->decodedskip,
+		   rq->decodedlength - rq->decodedskip);
+      return GRUB_ERR_NONE;
+    }
+
+  if (rq->alg == EROFS_COMPRESSION_INTERLACED)
+    {
+      grub_uint32_t count, rightpart, skip;
+
+      if (rq->inputsize > erofs_blocksz (rq->data) ||
+	  rq->decodedlength > erofs_blocksz (rq->data))
+	return grub_error (GRUB_ERR_BAD_FS, "invalid decompress request");
+
+      count = rq->decodedlength - rq->decodedskip;
+      skip = (rq->interlaced_offset + rq->decodedskip) &
+	     (erofs_blocksz (rq->data) - 1);
+      rightpart = grub_min (erofs_blocksz (rq->data) - skip, count);
+
+      grub_memcpy (rq->out, rq->in + skip, rightpart);
+      grub_memcpy (rq->out + rightpart, rq->in, count - rightpart);
+      return GRUB_ERR_NONE;
+    }
+
+  if (rq->alg == EROFS_COMPRESSION_LZ4)
+    return grub_erofs_zip_decompress_lz4 (rq);
+
+  return grub_error (GRUB_ERR_BAD_FS, "unknown compression alg %u", rq->alg);
+}
+
+static grub_err_t
+grub_erofs_pread (grub_fshelp_node_t node, char *buf, grub_off_t size,
+		  grub_off_t offset, grub_off_t *bytes);
+
+static grub_err_t
+grub_erofs_zip_read_data (grub_fshelp_node_t node, char *buf, grub_off_t size,
+			  grub_off_t offset, grub_off_t *bytes)
+{
+  struct grub_erofs_map_blocks map = {.index = GRUB_UINT_MAX};
+  grub_off_t end, length, skip;
+  bool trimmed;
+  char *raw = NULL;
+  unsigned int bufsize = 0;
+  struct grub_erofs_zip_decompress_req req;
+  grub_err_t err = GRUB_ERR_NONE;
+
+  if (bytes)
+    *bytes = 0;
+
+  end = offset + size;
+  while (end > offset)
+    {
+      map.m_la = end - 1;
+
+      err = grub_erofs_zip_map_blocks_iter (node, &map);
+      if (err)
+	break;
+
+      if (end < map.m_la + map.m_llen)
+	{
+	  length = end - map.m_la;
+	  trimmed = true;
+	}
+      else
+	{
+	  /* assert(end > map.m_la + map.m_llen) */
+	  length = map.m_llen;
+	  trimmed = false;
+	}
+
+      if (map.m_la < offset)
+	{
+	  skip = offset - map.m_la;
+	  end = offset;
+	}
+      else
+	{
+	  skip = 0;
+	  end = map.m_la;
+	}
+
+      if (!(map.m_flags & EROFS_MAP_MAPPED))
+	{
+	  grub_memset (buf + end - offset, 0, length);
+	  end = map.m_la;
+	  continue;
+	}
+
+      if (map.m_plen > bufsize)
+	{
+	  bufsize = map.m_plen;
+	  raw = grub_realloc (raw, bufsize);
+	  if (!raw)
+	    {
+	      err = grub_error (GRUB_ERR_OUT_OF_MEMORY, "out of memory");
+	      break;
+	    }
+	}
+
+      if (map.m_flags & EROFS_MAP_FRAGMENT)
+	{
+	  struct grub_fshelp_node packed_node = {
+	      .data = node->data,
+	      .ino = grub_le_to_cpu64 (node->data->sb.packed_nid),
+	      .inode_read = false,
+	      .z_header_read = false,
+	  };
+
+	  err = grub_erofs_read_inode (node->data, &packed_node);
+	  if (err)
+	    break;
+
+	  err =
+	      grub_erofs_pread (&packed_node, buf + end - offset, length - skip,
+				node->fragment_off + skip, NULL);
+	  if (err)
+	    break;
+	}
+      else
+	{
+	  err = grub_disk_read (
+	      node->data->disk, map.m_pa >> GRUB_DISK_SECTOR_BITS,
+	      map.m_pa & (GRUB_DISK_SECTOR_SIZE - 1), map.m_plen, raw);
+	  if (err)
+	    break;
+
+	  req = (struct grub_erofs_zip_decompress_req){
+	      .data = node->data,
+	      .in = raw,
+	      .out = buf + end - offset,
+	      .decodedskip = skip,
+	      .interlaced_offset =
+		  map.m_algorithmformat == EROFS_COMPRESSION_INTERLACED
+		      ? (map.m_la & (erofs_blocksz (node->data) - 1))
+		      : 0,
+	      .inputsize = map.m_plen,
+	      .decodedlength = length,
+	      .alg = map.m_algorithmformat,
+	      .partial_decoding =
+		  trimmed ? true
+			  : !(map.m_flags & EROFS_MAP_FULL_MAPPED) ||
+				(map.m_flags & EROFS_MAP_PARTIAL_REF),
+	  };
+
+	  err = grub_erofs_zip_decompress (&req);
+	  if (err)
+	    break;
+	}
+
+      if (bytes)
+	*bytes += length - skip;
+    }
+
+  if (raw)
+    grub_free (raw);
+  return err;
+}
+
+static grub_err_t
+grub_erofs_pread (grub_fshelp_node_t node, char *buf, grub_off_t size,
+		  grub_off_t offset, grub_off_t *bytes)
+{
+  grub_err_t err;
+  if (!node->inode_read)
+    {
+      err = grub_erofs_read_inode (node->data, node);
+      if (err)
+	return err;
+    }
+
+  switch (node->inode_datalayout)
+    {
+    case EROFS_INODE_FLAT_PLAIN:
+    case EROFS_INODE_FLAT_INLINE:
+    case EROFS_INODE_CHUNK_BASED:
+      return grub_erofs_read_raw_data (node, buf, size, offset, bytes);
+    case EROFS_INODE_COMPRESSED_FULL:
+    case EROFS_INODE_COMPRESSED_COMPACT:
+      return grub_erofs_zip_read_data (node, buf, size, offset, bytes);
+    default:
+      return grub_error (GRUB_ERR_BAD_FS, "unknown data layout %u",
+			 node->inode_datalayout);
+    }
+}
+
 static int
 grub_erofs_iterate_dir (grub_fshelp_node_t dir,
 			grub_fshelp_iterate_dir_hook_t hook, void *hook_data)
@@ -556,7 +1527,7 @@ grub_erofs_iterate_dir (grub_fshelp_node_t dir,
       struct grub_erofs_dirent *de = (void *) buf, *end;
       grub_uint16_t nameoff;
 
-      err = grub_erofs_read_raw_data (dir, buf, maxsize, offset, NULL);
+      err = grub_erofs_pread (dir, buf, maxsize, offset, NULL);
       if (err)
 	goto not_found;
 
@@ -587,7 +1558,7 @@ grub_erofs_iterate_dir (grub_fshelp_node_t dir,
 
 	  fdiro->data = dir->data;
 	  fdiro->ino = grub_le_to_cpu64 (de->nid);
-	  fdiro->inode_read = false;
+	  fdiro->inode_read = fdiro->z_header_read = false;
 
 	  nameoff = grub_le_to_cpu16 (de->nameoff);
 	  de_name = buf + nameoff;
@@ -660,7 +1631,7 @@ grub_erofs_read_symlink (grub_fshelp_node_t node)
   if (!symlink)
     return NULL;
 
-  grub_erofs_read_raw_data (node, symlink, sz - 1, 0, NULL);
+  grub_erofs_pread (node, symlink, sz - 1, 0, NULL);
   if (grub_errno)
     {
       grub_free (symlink);
@@ -708,6 +1679,7 @@ grub_erofs_mount (grub_disk_t disk, bool read_root)
 
   data->disk = disk;
   data->sb = sb;
+  data->inode.inode_read = data->inode.z_header_read = false;
 
   if (read_root)
     {
@@ -842,12 +1814,7 @@ grub_erofs_read (grub_file_t file, char *buf, grub_size_t len)
     {
       grub_erofs_read_inode (data, inode);
       if (grub_errno)
-	{
-	  ret = 0;
-	  grub_error (GRUB_ERR_IO, "cannot read @ inode %" PRIuGRUB_UINT64_T,
-		      inode->ino);
-	  goto end;
-	}
+	goto end;
     }
 
   file_size = erofs_inode_file_size (inode);
@@ -858,12 +1825,10 @@ grub_erofs_read (grub_file_t file, char *buf, grub_size_t len)
   if (off + len > file_size)
     len = file_size - off;
 
-  grub_erofs_read_raw_data (inode, buf, len, off, &ret);
+  grub_erofs_pread (inode, buf, len, off, &ret);
   if (grub_errno)
     {
       ret = 0;
-      grub_error (GRUB_ERR_IO, "cannot read file @ inode %" PRIuGRUB_UINT64_T,
-		  inode->ino);
       goto end;
     }
 
@@ -889,8 +1854,7 @@ grub_erofs_uuid (grub_device_t device, char **uuid)
 
   if (data)
     *uuid = grub_xasprintf (
-	"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%"
-	"02x",
+	"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
 	data->sb.uuid[0], data->sb.uuid[1], data->sb.uuid[2], data->sb.uuid[3],
 	data->sb.uuid[4], data->sb.uuid[5], data->sb.uuid[6], data->sb.uuid[7],
 	data->sb.uuid[8], data->sb.uuid[9], data->sb.uuid[10],
