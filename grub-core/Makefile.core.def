@@ -1438,8 +1438,15 @@ module = {
 };
 
 module = {
+  name = lz4_decompress;
+  common = lib/lz4/lz4_decompress.c;
+  cppflags = '-I$(srcdir)/lib/posix_wrap -I$(srcdir)/lib/lz4';
+};
+
+module = {
   name = erofs;
   common = fs/erofs.c;
+  cppflags = '-I$(srcdir)/lib/posix_wrap -I$(srcdir)/lib/lz4';
 };
 
 module = {

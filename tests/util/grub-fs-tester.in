@@ -1120,17 +1120,9 @@ for LOGSECSIZE in $(range "$MINLOGSECSIZE" "$MAXLOGSECSIZE" 1); do
 		xsquash4_*)
 		    echo mksquashfs "$MASTER" "${FSIMAGEP}0.img" -always-use-fragments -comp "${fs/squash4_/}" -b $BLKSIZE
 		    mksquashfs "$MASTER" "${FSIMAGEP}0.img" -always-use-fragments -comp "${fs/squash4_/}" -b $BLKSIZE ;;
-		x"erofs_compact")
-			echo mkfs.erofs -Eforce-inode-compact -L "$FSLABEL" "${FSIMAGEP}0.img" "$MNTPOINTRW"
-			mkfs.erofs -Eforce-inode-compact -L "$FSLABEL" "${FSIMAGEP}0.img" "$MNTPOINTRW"
-			;;
-		x"erofs_extended")
-			echo mkfs.erofs -Eforce-inode-extended -L "$FSLABEL" "${FSIMAGEP}0.img" "$MNTPOINTRW"
-			mkfs.erofs -Eforce-inode-extended -L "$FSLABEL" "${FSIMAGEP}0.img" "$MNTPOINTRW"
-			;;
-		x"erofs_chunk")
-			echo mkfs.erofs --chunksize=1048576 -L "$FSLABEL" "${FSIMAGEP}0.img" "$MNTPOINTRW"
-			mkfs.erofs --chunksize=1048576 -L "$FSLABEL" "${FSIMAGEP}0.img" "$MNTPOINTRW"
+		xerofs_*)
+			echo mkfs.erofs -zlz4 -E"${fs/erofs_/}" -L "$FSLABEL" "${FSIMAGEP}0.img" "$MNTPOINTRW"
+			mkfs.erofs -zlz4 -E"${fs/erofs_/}" -L "$FSLABEL" "${FSIMAGEP}0.img" "$MNTPOINTRW"
 			;;
 		x"bfs")
 		    sleep 1

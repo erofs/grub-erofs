@@ -15,6 +15,6 @@ if ! which mkfs.erofs >/dev/null 2>&1; then
    exit 99
 fi
 
-"@builddir@/grub-fs-tester" erofs_compact
-"@builddir@/grub-fs-tester" erofs_extended
-"@builddir@/grub-fs-tester" erofs_chunk
+"@builddir@/grub-fs-tester" erofs_ztailpacking
+"@builddir@/grub-fs-tester" erofs_fragments
+"@builddir@/grub-fs-tester" erofs_all-fragments
