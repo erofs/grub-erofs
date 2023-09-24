@@ -591,6 +591,20 @@ grub_strlen (const char *s)
   return p - s;
 }
 
+grub_size_t
+grub_strnlen (const char *s, grub_size_t n)
+{
+  const char *p = s;
+
+  if (n == 0)
+    return 0;
+
+  while (*p && n--)
+    p++;
+
+  return p - s;
+}
+
 static inline void
 grub_reverse (char *str)
 {
